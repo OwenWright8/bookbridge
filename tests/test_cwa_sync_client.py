@@ -187,7 +187,7 @@ class TestCWASyncClient(unittest.TestCase):
         self.assertTrue(result.success)
         self.assertAlmostEqual(result.location, 0.50)
         self.mock_sync_api.update_reading_state.assert_called_once_with(
-            'test-uuid', 0.50, 'Reading'
+            'test-uuid', 0.50, 'Reading', location=None
         )
 
     def test_update_progress_finished(self):
@@ -201,7 +201,7 @@ class TestCWASyncClient(unittest.TestCase):
 
         self.assertTrue(result.success)
         self.mock_sync_api.update_reading_state.assert_called_once_with(
-            'test-uuid', 0.995, 'Finished'
+            'test-uuid', 0.995, 'Finished', location=None
         )
 
     def test_update_progress_ready_to_read(self):
@@ -215,7 +215,40 @@ class TestCWASyncClient(unittest.TestCase):
 
         self.assertTrue(result.success)
         self.mock_sync_api.update_reading_state.assert_called_once_with(
-            'test-uuid', 0.0, 'ReadyToRead'
+            'test-uuid', 0.0, 'ReadyToRead', location=None
+        )
+
+    def test_update_progress_resolves_and_sends_kobo_location(self):
+        """The one path nothing else proves: xpath data present -> offset
+        resolved via ebook_parser -> span resolved via kepub_span_resolver
+        -> that exact location dict reaches update_reading_state (not None).
+        """
+        self.mock_sync_api.resolve_book_uuid.return_value = 'test-uuid'
+        self.mock_sync_api.update_reading_state.return_value = True
+        self.mock_ebook_parser.resolve_xpath_to_index.return_value = 9876
+
+        self.client.kepub_span_resolver = Mock()
+        self.client.kepub_span_resolver.resolve.return_value = ("chapter3.xhtml", "kobo.2.5")
+
+        locator = LocatorResult(
+            percentage=0.42,
+            xpath="/body/DocFragment[3]/body/p[2]/text().0",
+            perfect_ko_xpath="/body/DocFragment[3]/body/p[2]/text().0",
+        )
+        request = UpdateProgressRequest(locator_result=locator)
+
+        result = self.client.update_progress(self.test_book, request)
+
+        self.assertTrue(result.success)
+        self.mock_ebook_parser.resolve_xpath_to_index.assert_called_once_with(
+            'test-book.epub', "/body/DocFragment[3]/body/p[2]/text().0"
+        )
+        self.client.kepub_span_resolver.resolve.assert_called_once_with(
+            '42', 'test-book.epub', 9876
+        )
+        self.mock_sync_api.update_reading_state.assert_called_once_with(
+            'test-uuid', 0.42, 'Reading',
+            location={"Source": "chapter3.xhtml", "Type": "KoboSpan", "Value": "kobo.2.5"},
         )
 
     def test_update_progress_no_uuid(self):

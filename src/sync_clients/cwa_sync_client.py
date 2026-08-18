@@ -14,9 +14,10 @@ from src.api.cwa_sync_api import CWASyncApi, STATUS_READING, STATUS_FINISHED, ST
 from src.api.cwa_client import CWAClient
 from src.db.models import Book, State
 from src.utils.ebook_utils import EbookParser
+from src.utils.kepub_span_resolver import KepubSpanResolver
 from src.utils.progress_metadata import parse_service_timestamp
 from src.sync_clients.sync_client_interface import (
-    SyncClient, SyncResult, UpdateProgressRequest, ServiceState,
+    SyncClient, SyncResult, UpdateProgressRequest, ServiceState, LocatorResult,
 )
 
 logger = logging.getLogger(__name__)
@@ -28,6 +29,7 @@ class CWASyncClient(SyncClient):
         self.cwa_sync_api = cwa_sync_api
         self.cwa_client = cwa_client
         self.delta_thresh = float(os.getenv("SYNC_DELTA_KOSYNC_PERCENT", 1)) / 100.0
+        self.kepub_span_resolver = KepubSpanResolver(ebook_parser, cwa_sync_api)
 
     def is_configured(self) -> bool:
         return self.cwa_sync_api.is_configured()
@@ -102,6 +104,43 @@ class CWASyncClient(SyncClient):
             return self.ebook_parser.get_text_at_percentage(epub, pct)
         return None
 
+    def _resolve_kobo_location(self, book: Book, locator: LocatorResult) -> Optional[dict]:
+        """Resolve a native Kobo span Location for the given locator.
+
+        Returns None (falling back to percent-only) whenever resolution
+        isn't possible, rather than risk sending a Location that doesn't
+        match the KePub Nickel actually has on-device.
+        """
+        book_id = getattr(book, "ebook_source_id", None)
+        epub = self._resolve_epub_filename(book)
+        if not book_id or not epub or not locator:
+            return None
+
+        global_offset = locator.match_index
+        if global_offset is None:
+            xpath = locator.perfect_ko_xpath or locator.xpath
+            if not xpath:
+                return None
+            try:
+                global_offset = self.ebook_parser.resolve_xpath_to_index(epub, xpath)
+            except Exception as e:
+                logger.debug(f"📖 CWA Sync: could not resolve offset for Kobo Location: {e}")
+                return None
+        if global_offset is None:
+            return None
+
+        try:
+            resolved = self.kepub_span_resolver.resolve(str(book_id), epub, global_offset)
+        except Exception as e:
+            logger.debug(f"📖 CWA Sync: Kobo span resolution failed for '{book.abs_title}': {e}", exc_info=True)
+            return None
+        if resolved is None:
+            return None
+
+        href, span_id = resolved
+        logger.debug(f"📖 CWA Sync: resolved Kobo Location for '{book.abs_title}' -> {href}#{span_id}")
+        return {"Source": href, "Type": "KoboSpan", "Value": span_id}
+
     def update_progress(self, book: Book, request: UpdateProgressRequest) -> SyncResult:
         uuid = self._resolve_uuid(book)
         if not uuid:
@@ -118,7 +157,8 @@ class CWASyncClient(SyncClient):
         else:
             status = STATUS_READY
 
-        success = self.cwa_sync_api.update_reading_state(uuid, pct, status)
+        location = self._resolve_kobo_location(book, request.locator_result)
+        success = self.cwa_sync_api.update_reading_state(uuid, pct, status, location=location)
 
         if success:
             try:

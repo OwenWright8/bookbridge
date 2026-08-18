@@ -119,8 +119,17 @@ class CWASyncApi:
             logger.error(f"❌ CWA Sync: Failed to get reading state for {book_uuid}: {e}", exc_info=True)
             return None
 
-    def update_reading_state(self, book_uuid: str, progress_percent: float, status: str = STATUS_READING) -> bool:
-        """Push reading position to CWA via Kobo sync protocol."""
+    def update_reading_state(self, book_uuid: str, progress_percent: float, status: str = STATUS_READING,
+                              location: dict = None) -> bool:
+        """Push reading position to CWA via Kobo sync protocol.
+
+        `location`, when provided, is a native Kobo span pointer
+        ({"Source": href, "Type": "KoboSpan", "Value": "kobo.N.M"}) — see
+        KepubSpanResolver. Percent alone doesn't move a stock Kobo's resume
+        position; Nickel trusts its own local CurrentBookmark.Location over
+        the server-reported percent. Left as None when resolution wasn't
+        possible, which CWA/Nickel treat as percent-only.
+        """
         if not self.is_configured():
             return False
 
@@ -128,12 +137,13 @@ class CWASyncApi:
             url = f"{self._base_url}/library/{book_uuid}/state"
             # CWA API uses 0-100 scale; bridge uses 0-1
             api_pct = progress_percent * 100.0
+            logger.debug(f"📖 CWA Sync: resolved Location={location!r} for {book_uuid}")
             payload = {
                 "ReadingStates": [{
                     "CurrentBookmark": {
                         "ProgressPercent": api_pct,
                         "ContentSourceProgressPercent": api_pct,
-                        "Location": None,
+                        "Location": location,
                     },
                     "Statistics": None,
                     "StatusInfo": {"Status": status},
@@ -162,3 +172,27 @@ class CWASyncApi:
         if not self._cwa_client:
             return None
         return self._cwa_client.get_book_uuid(calibre_id)
+
+    def download_kepub(self, book_id: str) -> bytes | None:
+        """Download the actual converted KePub CWA serves to a real Kobo device.
+
+        Used to read kepubify's real embedded span IDs — CWA stores whatever
+        Location a client sends verbatim (no server-side validation), so a
+        span ID only works if it matches what's really in the file Nickel
+        has on-device. This hits the same endpoint a real device does
+        (Calibre-Web's /kobo/<token>/download/<book_id>/<format>), which
+        converts EPUB -> KEPUB on the fly via kepubify if not already cached.
+        """
+        if not self.is_configured() or not book_id:
+            return None
+
+        try:
+            url = f"{self._server}/kobo/{self._token}/download/{book_id}/kepub"
+            r = self._session.get(url, timeout=30)
+            if r.status_code != 200:
+                logger.debug(f"📖 CWA Sync: kepub download for {book_id} returned {r.status_code}")
+                return None
+            return r.content
+        except Exception as e:
+            logger.debug(f"📖 CWA Sync: kepub download failed for {book_id}: {e}")
+            return None
